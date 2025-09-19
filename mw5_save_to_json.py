@@ -20,10 +20,6 @@ def _unpack_le(fmt: str, size: int, buf: bytes, off: int) -> Tuple[Any, int]:
     return struct.unpack_from(fmt, buf, off)[0], off + size
 
 
-def u16_le(buf: bytes, off: int) -> Tuple[int, int]:
-    return _unpack_le("<H", 2, buf, off)
-
-
 def i32_le(buf: bytes, off: int) -> Tuple[int, int]:
     return _unpack_le("<i", 4, buf, off)
 
@@ -61,6 +57,9 @@ QUOTED_RE = re.compile(rb'"(.*?)"')  # ASCII quotes only (bytes-safe)
 INT_RE = re.compile(rb"[-+]?\d+")
 FLOAT_RE = re.compile(rb"[-+]?(?:\d+\.\d*|\.\d+)(?:[eE][-+]?\d+)?")
 GUID_HEX_BYTES_RE = re.compile(rb"(?:[0-9A-Fa-f]{2}\s*){16,}")
+# Explicit MW5 binary layout constants to replace magic numbers
+SIZE_PREFIX_LEN = 9  # 8-byte LE size + 1 empty byte before payload
+BOOL_PREFIX_PAD = 8  # 8 empty bytes before a 1-byte bool value
 
 
 def to_ascii(s: bytes) -> str:
@@ -105,73 +104,62 @@ def find_key_before(buf: bytes, type_pos: int, max_back: int = 160) -> Optional[
 
 
 # -------------------- MW5 numeric payload heuristics --------------------
-# Int64Property: u16==0x0800 (2048), 8x 0x00, then 8-byte LE value
-# IntProperty:   u16==0x0400 (1024), 8x 0x00, then 4-byte LE value, then +4 bytes (ignored)
-def try_mw5_int64_pattern(block: bytes) -> Optional[int]:
+def _read_after_size_prefix(block: bytes, reader) -> Optional[Any]:
+    """
+    Shared helper for MW5 patterns where payload follows a size+pad prefix.
+    Calls 'reader(block, offset)' and returns the value or None on error.
+    """
     try:
-        for skip in range(0, 5):  # allow a few noise bytes before the tag
-            if len(block) < skip + 2 + 8 + 8:
-                continue
-            tag, off = u16_le(block, skip)
-            if tag != 0x0800:
-                continue
-            zeros, off2 = read_bytes(block, off, 8)
-            if any(zeros):
-                continue
-            val, _ = i64_le(block, off2)
-            return val
+        if len(block) < SIZE_PREFIX_LEN:
+            return None
+        val, _ = reader(block, SIZE_PREFIX_LEN)
+        return val
     except Exception:
-        pass
-    return None
+        return None
 
 
 def try_mw5_int32_pattern(block: bytes) -> Optional[int]:
-    try:
-        for skip in range(0, 5):
-            if len(block) < skip + 2 + 8 + 4:
-                continue
-            tag, off = u16_le(block, skip)
-            if tag != 0x0400:
-                continue
-            zeros, off2 = read_bytes(block, off, 8)
-            if any(zeros):
-                continue
-            val, _ = i32_le(block, off2)
-            # trailing 4 bytes often present; ignore
-            return val
-    except Exception:
-        pass
-    return None
+    # Pattern: [8-byte LE size][1 empty byte][4-byte LE int32]
+    return _read_after_size_prefix(block, i32_le)
+
+
+def try_mw5_int64_pattern(block: bytes) -> Optional[int]:
+    # Pattern: [8-byte LE size][1 empty byte][8-byte LE int64]
+    return _read_after_size_prefix(block, i64_le)
 
 
 def try_mw5_float(block: bytes) -> Optional[float]:
-    try:
-        if len(block) >= 10 + 4:
-            val, _ = f32_le(block, 10)
-            return float(val)
-    except Exception:
-        pass
-    return None
+    # Pattern: [8-byte LE size][1 empty byte][4-byte LE float]
+    val = _read_after_size_prefix(block, f32_le)
+    return float(val) if val is not None else None
 
 
 def try_mw5_double(block: bytes) -> Optional[float]:
-    try:
-        if len(block) >= 10 + 8:
-            val, _ = f64_le(block, 10)
-            return float(val)
-    except Exception:
-        pass
-    return None
+    # Pattern: [8-byte LE size][1 empty byte][8-byte LE double]
+    val = _read_after_size_prefix(block, f64_le)
+    return float(val) if val is not None else None
 
 
 def try_mw5_bool(block: bytes) -> Optional[bool]:
+    # Pattern: [8 empty bytes][1-byte bool value]
     try:
-        if len(block) >= 9 + 1:
-            raw_byte, _ = read_bytes(block, 9, 1)
-            return bool(raw_byte[0])
+        if len(block) < BOOL_PREFIX_PAD + 1:
+            return None
+        raw_byte, _ = read_bytes(block, BOOL_PREFIX_PAD, 1)
+        return bool(raw_byte[0])
     except Exception:
-        pass
-    return None
+        return None
+
+
+def try_mw5_byte_property(block: bytes) -> Optional[int]:
+    try:
+        # Pattern: [4-byte LE int][1 empty terminating byte] (some payloads may omit terminator in slice)
+        if len(block) < 4:
+            return None
+        val, _ = i32_le(block, 0)
+        return val
+    except Exception:
+        return None
 
 
 # -------------------- DateTime (.NET ticks) --------------------
@@ -190,18 +178,20 @@ def try_mw5_datetime(block: bytes) -> Optional[dict]:
     """
     MW5 DateTime struct payload:
       - ASCII token 'DateTime' appears in the slice
-      - exactly 18 bytes later begins the int64 LE ticks value
-    Fallback to the 0x0800 + 8x00 + int64 pattern if needed.
+      - immediately after the token there is an empty byte (0x00)
+      - then 17 empty filler bytes (0x00)
+      - then the 8-byte LE ticks value
     """
     p = block.find(b"DateTime")
     if p != -1:
-        ticks_off = p + len(b"DateTime") + 18
+        ticks_off = p + len(b"DateTime") + 1 + 17  # 1 empty after type name + 17 filler zeros
         if ticks_off + 8 <= len(block):
             try:
                 ticks, _ = i64_le(block, ticks_off)
                 return {"ticks": ticks, "unit": "ticks_100ns", "value": ticks_to_iso(ticks)}
             except Exception:
                 pass
+    # Fallback to generic Int64-after-size-prefix layout
     val = try_mw5_int64_pattern(block)
     if val is not None:
         return {"ticks": val, "unit": "ticks_100ns", "value": ticks_to_iso(val)}
@@ -209,15 +199,6 @@ def try_mw5_datetime(block: bytes) -> Optional[dict]:
 
 
 # -------------------- Fallback decoders --------------------
-def slice_bool_fallback(block: bytes) -> Optional[bool]:
-    if b"\x01" in block: return True
-    if b"\x00" in block: return False
-    s = " " + to_ascii(block).lower() + " "
-    if " true " in s: return True
-    if " false " in s: return False
-    return None
-
-
 def slice_guid(block: bytes) -> Optional[str]:
     m = GUID_HEX_BYTES_RE.search(block)
     if m:
@@ -228,60 +209,74 @@ def slice_guid(block: bytes) -> Optional[str]:
     return None
 
 
+def _decode_stringlike_structured(block: bytes) -> Optional[str]:
+    """
+    Attempt to decode ObjectProperty / StrProperty / NameProperty payloads with pattern:
+      [8 bytes outer size][4 bytes inner size][inner bytes including 0x00 terminator]
+    Returns a clean string (without embedded NULs) if the pattern matches.
+    """
+    try:
+        # Need at least 12 bytes for sizes
+        if len(block) < 12:
+            return None
+
+        # Try a few starting offsets in case of a leading padding/flag byte
+        for base_off in (0, 1, 2, 3, 4):
+            if len(block) < base_off + 12:
+                break
+            outer_size, off = _unpack_le("<Q", 8, block, base_off)
+            inner_size, off = _unpack_le("<I", 4, block, off)
+
+            # Sanity checks
+            if inner_size <= 0 or inner_size > len(block) - off:
+                continue
+            # Outer size may include header bytes; require it at least to be big enough to contain inner
+            if outer_size and outer_size < 4 + inner_size:
+                continue
+
+            raw, _ = read_bytes(block, off, inner_size)
+
+            # If terminator present, drop it
+            if raw and raw[-1] == 0x00:
+                raw = raw[:-1]
+
+            # Decode and sanitize NULs just in case
+            s = to_ascii(raw).replace("\x00", "").strip()
+            return s if s is not None else ""
+
+        return None
+    except Exception:
+        return None
+
+
 def slice_stringlike(block: bytes) -> Optional[str]:
+    # Try structured pattern first to avoid leaking NULs into JSON
+    structured = _decode_stringlike_structured(block)
+    if structured is not None:
+        return structured
+
+    # If a NUL appears early, treat it as end-of-string to avoid swallowing following headers
+    nul_pos = block.find(b"\x00")
+    if 0 <= nul_pos < len(block):
+        head = block[:nul_pos]
+        txt = to_ascii(head).strip()
+        if txt:
+            return txt
+
     p = best_match(PATH_RE, block)
     if p:
         return to_ascii(p)
     q = best_group(QUOTED_RE, block)
     if q:
         return to_ascii(q).strip()
-    txt = " ".join(to_ascii(block).split())
+    # Fallback: decode whole block but strip NULs and collapse whitespace
+    txt = " ".join(to_ascii(block).replace("\x00", "").split())
     return txt if txt else None
 
 
 def slice_enum(block: bytes) -> Optional[str]:
     e = best_match(ENUM_RE, block)
     return to_ascii(e) if e else slice_stringlike(block)
-
-
-def slice_float_fallback(block: bytes) -> Optional[float]:
-    try:
-        v, _ = f32_le(block, 0)
-        return float(v)
-    except Exception:
-        pass
-    m = FLOAT_RE.search(block)
-    if m:
-        try:
-            return float(to_ascii(m.group(0)))
-        except Exception:
-            return None
-    return None
-
-
-def slice_double_fallback(block: bytes) -> Optional[float]:
-    try:
-        v, _ = f64_le(block, 0)
-        return float(v)
-    except Exception:
-        pass
-    m = FLOAT_RE.search(block)
-    if m:
-        try:
-            return float(to_ascii(m.group(0)))
-        except Exception:
-            return None
-    return None
-
-
-def slice_int_fallback(block: bytes) -> Optional[int]:
-    m = INT_RE.search(block)
-    if m:
-        try:
-            return int(m.group(0))
-        except Exception:
-            return None
-    return None
 
 
 # -------------------- Parser core --------------------
@@ -327,53 +322,35 @@ def parse_mixed(buf: bytes) -> Dict[str, Any]:
             stack.pop()
 
         nxt_start = tokens[i + 1][2] if i + 1 < len(tokens) else len(buf)
-        block = buf[e:nxt_start]
+        # Account for an empty byte (0x00) immediately following every type name token
+        block_start = e + 1 if e < len(buf) and buf[e] == 0x00 else e
+        block = buf[block_start:nxt_start]
         cur = stack[-1]
 
         if tname == b"Int64Property":
             val = try_mw5_int64_pattern(block)
-            if val is None:
-                try:
-                    val, _ = i64_le(block, 0)
-                except Exception:
-                    val = slice_int_fallback(block)
             attach_value(cur, key, val)
             # Special: StartingDateTicks -> also add StartingDate
             if key == "StartingDateTicks" and isinstance(val, int):
                 attach_value(cur, "StartingDate", ticks_to_iso(val))
 
         elif tname == b"IntProperty":
-            val = try_mw5_int32_pattern(block)
-            if val is None:
-                try:
-                    val, _ = i32_le(block, 0)
-                except Exception:
-                    val = slice_int_fallback(block)
-            attach_value(cur, key, val)
+            attach_value(cur, key, try_mw5_int32_pattern(block))
 
         elif tname == b"BoolProperty":
-            val = try_mw5_bool(block)
-            if val is None:
-                val = slice_bool_fallback(block)
-            attach_value(cur, key, val)
+            attach_value(cur, key, try_mw5_bool(block))
 
         elif tname == b"ByteProperty":
-            v = try_mw5_int32_pattern(block)  # sometimes same header pattern shows up
+            v = try_mw5_byte_property(block)
             if v is None:
                 v = block[0] if block else None
             attach_value(cur, key, v)
 
         elif tname == b"FloatProperty":
-            v = try_mw5_float(block)
-            if v is None:
-                v = slice_float_fallback(block)
-            attach_value(cur, key, v)
+            attach_value(cur, key, try_mw5_float(block))
 
         elif tname == b"DoubleProperty":
-            v = try_mw5_double(block)
-            if v is None:
-                v = slice_double_fallback(block)
-            attach_value(cur, key, v)
+            attach_value(cur, key, try_mw5_double(block))
 
         elif tname in (b"StrProperty", b"NameProperty", b"ObjectProperty"):
             attach_value(cur, key, slice_stringlike(block))
@@ -385,7 +362,7 @@ def parse_mixed(buf: bytes) -> Dict[str, Any]:
             attach_value(cur, key, slice_guid(block))
 
         elif tname == b"StructProperty":
-            # Explicit DateTime handling with "DateTime" plus 18 bytes plus ticks
+            # Explicit DateTime handling
             if b"DateTime" in block:
                 dt = try_mw5_datetime(block)
                 if dt is not None:
@@ -455,8 +432,7 @@ def main():
     with open(in_path, "rb") as f:
         bs = f.read()
 
-    nested = parse_mixed(bs)
-    result = {"detected_format": "mw5-mixed", "nested": nested}
+    result = parse_mixed(bs)
 
     safe = safe_export(result, max_depth=1200, max_list=2000)
     with open(out_path, "w", encoding="utf-8") as f:
